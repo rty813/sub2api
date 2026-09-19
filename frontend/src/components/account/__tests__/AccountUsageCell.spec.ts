@@ -141,6 +141,90 @@ describe('AccountUsageCell', () => {
     wrapper.unmount()
   })
 
+  it('surfaces Codex ticket retry state, and only while the ticket is missing', async () => {
+    getUsage.mockResolvedValue({})
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 9703,
+          platform: 'openai',
+          type: 'oauth',
+          codex_turn_tickets: [
+            {
+              model: 'gpt-6-astra',
+              ready: false,
+              remaining_seconds: 0,
+              blocked: true,
+              last_failure_reason: 'rate_limited',
+              last_failure_status: 429,
+              consecutive_failures: 3,
+              retry_in_seconds: 90,
+            },
+            // A healthy ticket must not advertise stale failure history.
+            {
+              model: 'gpt-5.6-sol',
+              ready: true,
+              remaining_seconds: 600,
+              blocked: false,
+              last_failure_reason: 'network',
+              consecutive_failures: 2,
+              retry_in_seconds: 12,
+            },
+          ],
+        }),
+      },
+      global: { stubs: {
+        OpenAIQuotaResetCell: { template: '<div data-test="quota-reset" />' },
+        UsageProgressBar: true,
+        AccountQuotaInfo: true,
+      } },
+    })
+    await flushPromises()
+
+    const rows = wrapper.findAll('[title]').filter(el => (el.attributes('title') || '').startsWith('gpt-6-astra'))
+    expect(rows.length).toBeGreaterThan(0)
+    // The tooltip carries the reason; the row itself only gets the short suffix.
+    expect(rows[0].attributes('title')).toContain('codexTurnTicketFailureDetail')
+    expect(wrapper.text()).toContain('admin.accounts.openai.codexTurnTicketRetry')
+    // Ready tickets render their remaining time, not a retry hint.
+    expect(wrapper.text()).toContain('10m00s')
+
+    const readyRow = wrapper.findAll('[title]').filter(el => el.attributes('title') === 'gpt-5.6-sol')
+    expect(readyRow.length).toBeGreaterThan(0)
+    wrapper.unmount()
+  })
+
+  it('never leaks ticket material or proxy credentials into the cell', async () => {
+    getUsage.mockResolvedValue({})
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 9704,
+          platform: 'openai',
+          type: 'oauth',
+          codex_turn_tickets: [
+            {
+              model: 'gpt-6-astra',
+              ready: false,
+              remaining_seconds: 0,
+              blocked: false,
+              last_failure_reason: 'proxy_config',
+              consecutive_failures: 1,
+              retry_in_seconds: 30,
+            },
+          ],
+        }),
+      },
+      global: { stubs: { OpenAIQuotaResetCell: true, UsageProgressBar: true, AccountQuotaInfo: true } },
+    })
+    await flushPromises()
+    const html = wrapper.html()
+    expect(html).not.toContain('gAAAAA')
+    expect(html).not.toContain('http://')
+    expect(html).not.toContain('socks5')
+    wrapper.unmount()
+  })
+
   it('renders eligible Ollama Cloud state and forwards query updates', async () => {
     const wrapper = mount(AccountUsageCell, {
       props: {

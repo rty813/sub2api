@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -260,7 +261,7 @@ func TestRefreshOpenAICodexTickets_SuccessClearsPriorFailure(t *testing.T) {
 			codexTicketOKResponse,
 		},
 	}
-	svc, _ := codexTicketHarvestService(t, config.OpenAICodexTicketConfig{
+	svc, repo := codexTicketHarvestService(t, config.OpenAICodexTicketConfig{
 		Enabled:         true,
 		Models:          []string{"gpt-6-astra"},
 		HarvestProxyURL: "socks5h://proxy.example.com:1080",
@@ -279,7 +280,12 @@ func TestRefreshOpenAICodexTickets_SuccessClearsPriorFailure(t *testing.T) {
 
 	require.Equal(t, int64(2), upstream.calls.Load())
 	require.Zero(t, svc.openAICodexTicketRetrySnapshot(key).ConsecutiveFailures)
-	require.True(t, svc.lookupOpenAICodexTicket(&account, "gpt-6-astra").valid(time.Now(), 292))
+	// The recovered ticket must actually be persisted, not just remembered in RAM.
+	repo.mu.Lock()
+	persisted := maps.Clone(repo.updates)
+	repo.mu.Unlock()
+	stored := &Account{ID: 41, Platform: PlatformOpenAI, Extra: persisted}
+	require.True(t, svc.lookupOpenAICodexTicket(stored, "gpt-6-astra").valid(time.Now(), 292))
 }
 
 func TestRefreshOpenAICodexTickets_MissingProxySkipsRequestAndRecoversOnFix(t *testing.T) {
