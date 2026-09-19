@@ -765,6 +765,17 @@ export default {
           proxy_config: '采票代理未配置',
           unexpected_status: '上游状态异常',
         },
+        codexTurnTicketCooldown: '{scope}{reason}，暂停采票',
+        codexTurnTicketCooldownIn: '{scope}{reason}，{time} 后恢复采票',
+        codexTurnTicketCooldownScopeAccount: '账号',
+        codexTurnTicketCooldownScopeModel: '该模型',
+        codexTurnTicketCooldownReason: {
+          rate_limited: '限流中',
+          overloaded: '过载中',
+          temp_unschedulable: '临时不可调度',
+          runtime_block: '已被封禁',
+          model_breaker: '熔断冷却中',
+        },
         codexImageTool: 'Codex 图片桥接策略',
         codexImageToolDesc:
           '统一控制 Codex /responses 文本请求的 hosted image_generation 桥接和客户端图片工具声明。hosted 工具自动注入仅适用于非 Responses Lite 请求；账号级策略优先于渠道和全局配置，不影响独立图片生成接口。',

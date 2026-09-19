@@ -687,6 +687,17 @@ export default {
           proxy_config: 'Harvest proxy not configured',
           unexpected_status: 'Unexpected upstream status',
         },
+        codexTurnTicketCooldown: '{scope} {reason}; harvesting paused',
+        codexTurnTicketCooldownIn: '{scope} {reason}; harvesting resumes in {time}',
+        codexTurnTicketCooldownScopeAccount: 'Account',
+        codexTurnTicketCooldownScopeModel: 'This model',
+        codexTurnTicketCooldownReason: {
+          rate_limited: 'rate limited',
+          overloaded: 'overloaded',
+          temp_unschedulable: 'temporarily unschedulable',
+          runtime_block: 'blocked',
+          model_breaker: 'in breaker cooldown',
+        },
         codexImageTool: 'Codex image bridge policy',
         codexImageToolDesc:
           'Controls the hosted image_generation bridge and client-declared image tools on Codex /responses text requests. Hosted auto-injection applies only to non-Responses Lite requests. Account policy takes precedence over channel and global settings; standalone image-generation endpoints are unaffected.',

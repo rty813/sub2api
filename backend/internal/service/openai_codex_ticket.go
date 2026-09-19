@@ -121,6 +121,15 @@ type OpenAICodexTicketStatus struct {
 	NextRetryAt         *time.Time `json:"next_retry_at,omitempty"`
 	// RetryInSeconds 是相对于本次查询时刻的剩余等待秒数，方便前端直接展示。
 	RetryInSeconds int64 `json:"retry_in_seconds,omitempty"`
+	// HarvestPaused 表示采票被上游限流/冷却挡住了：这不是失败，是在等恢复。
+	// CooldownUntil 可能为空（确知在冷却但拿不到恢复时刻），所以要单独给一个布尔。
+	HarvestPaused bool `json:"harvest_paused,omitempty"`
+	// CooldownScope 区分账号级（全部模型）与模型级（仅该模型）限流。
+	CooldownScope string `json:"cooldown_scope,omitempty"`
+	// CooldownReason 是归一化后的冷却类别（rate_limited/overloaded/...）。
+	CooldownReason    string     `json:"cooldown_reason,omitempty"`
+	CooldownUntil     *time.Time `json:"cooldown_until,omitempty"`
+	CooldownInSeconds int64      `json:"cooldown_in_seconds,omitempty"`
 }
 
 // OpenAICodexTicketStatuses 只读取门票本身，不含退避状态；带退避状态的版本是
@@ -165,15 +174,28 @@ func OpenAICodexTicketStatuses(account *Account, cfg config.OpenAICodexTicketCon
 	return out
 }
 
-// OpenAICodexTicketStatusesForAccount 在门票摘要上叠加采票退避状态，供管理端
-// 解释「为什么这个号这个模型还没有票、什么时候会再试」。
+// OpenAICodexTicketStatusesForAccount 在门票摘要上叠加采票退避状态与限流冷却状态，
+// 供管理端解释「为什么这个号这个模型还没有票、什么时候会再试」。
 // 退避状态是内存态：网关实例缺失或刚重启时这些字段为空，表示「下个周期就会重试」。
+// 冷却状态则是实时计算的（账号快照 + 进程内封禁），不落任何新状态。
 func (s *OpenAIGatewayService) OpenAICodexTicketStatusesForAccount(account *Account, cfg config.OpenAICodexTicketConfig, now time.Time) []OpenAICodexTicketStatus {
 	out := OpenAICodexTicketStatuses(account, cfg, now)
 	if s == nil || account == nil || account.ID <= 0 {
 		return out
 	}
 	for i := range out {
+		if cooldown := s.openAICodexTicketCooldownFor(context.Background(), account, out[i].Model, now); cooldown.Active {
+			out[i].HarvestPaused = true
+			out[i].CooldownScope = string(cooldown.Scope)
+			out[i].CooldownReason = cooldown.Reason
+			if !cooldown.Until.IsZero() {
+				until := cooldown.Until
+				out[i].CooldownUntil = &until
+			}
+			if remaining := int64(cooldown.remainingAt(now) / time.Second); remaining > 0 {
+				out[i].CooldownInSeconds = remaining
+			}
+		}
 		state := s.openAICodexTicketRetrySnapshot(openAICodexTicketKey(account.ID, out[i].Model))
 		if state.ConsecutiveFailures <= 0 {
 			continue
@@ -551,6 +573,7 @@ func (s *OpenAIGatewayService) refreshOpenAICodexTickets(ctx context.Context) {
 	}
 	targets := make([]harvestTarget, 0, len(accounts))
 	selected := 0
+	cooled := 0
 	for i := range accounts {
 		account := accounts[i]
 		if account.Status != StatusActive || !isOpenAICodexTicketAccount(&account) {
@@ -568,6 +591,14 @@ func (s *OpenAIGatewayService) refreshOpenAICodexTickets(ctx context.Context) {
 				continue
 			}
 			selected++
+			// 账号或该模型仍在上游限流/冷却窗口内：这一发根本不该出站。
+			// 跳过不是失败，不进退避阶梯、不累加连续失败次数；窗口到期后下一轮
+			// 自动恢复采票。逐条原因只在管理端按账号展示，这里只记聚合计数，
+			// 免得每 6 秒刷一屏日志。
+			if s.openAICodexTicketCooldownFor(ctx, &account, model, now).Active {
+				cooled++
+				continue
+			}
 			state := s.openAICodexTicketRetryMutate(key, func(st openAICodexTicketRetryState) openAICodexTicketRetryState {
 				return st.applyConfigFingerprint(fingerprint, now)
 			})
@@ -615,7 +646,8 @@ func (s *OpenAIGatewayService) refreshOpenAICodexTickets(ctx context.Context) {
 		logger.L().Info("openai_codex_ticket probe cycle",
 			zap.Int("selected", selected),
 			zap.Int("attempted", len(targets)),
-			zap.Int("deferred", selected-len(targets)),
+			zap.Int("rate_limited", cooled),
+			zap.Int("deferred", selected-cooled-len(targets)),
 			zap.Int("max_concurrency", cfg.HarvestMaxConcurrency),
 		)
 	}
@@ -653,6 +685,12 @@ func (s *OpenAIGatewayService) probeOnceOpenAICodexTicket(ctx context.Context, a
 		return
 	}
 	_, _, _ = s.openaiCodexTicketFlight.Do(key, func() (any, error) {
+		// 入队到真正出站之间可能隔了整个并发窗口：业务请求在这段时间里吃到的
+		// 429 会写进进程内封禁/熔断，这里复查一次，避免拿着过期判断继续打。
+		// 同样按「跳过」处理：不记失败、不推进退避。
+		if s.openAICodexTicketCooldownFor(ctx, account, model, time.Now()).Active {
+			return nil, nil
+		}
 		token, _, err := s.GetAccessToken(ctx, account)
 		if err != nil || strings.TrimSpace(token) == "" {
 			if ctx.Err() != nil {

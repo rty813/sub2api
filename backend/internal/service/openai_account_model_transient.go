@@ -162,6 +162,33 @@ func (s *openAIAccountModelTransientState) isBlocked(accountID int64, model stri
 	return !entry.blockUntil.IsZero() && now.Before(entry.blockUntil)
 }
 
+// blockedUntil 返回该账号×模型熔断冷却的到期时刻，未在冷却中返回零值。
+// 与 isBlocked 的判定完全一致，只是额外把到期时刻交出去，供「还要等多久」展示。
+// 读路径刻意不清理过期条目：清理由 isBlocked/recordFailure 承担，避免只读查询写表。
+func (s *openAIAccountModelTransientState) blockedUntil(accountID int64, model string, now time.Time) time.Time {
+	key, ok := openAIAccountModelTransientKey(accountID, model)
+	if s == nil || !ok {
+		return time.Time{}
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, exists := s.entries[key]
+	if !exists {
+		return time.Time{}
+	}
+	if !entry.lastFailure.IsZero() && now.Sub(entry.lastFailure) > openAIModelTransientStreakTTL {
+		return time.Time{}
+	}
+	if entry.blockUntil.IsZero() || !now.Before(entry.blockUntil) {
+		return time.Time{}
+	}
+	return entry.blockUntil
+}
+
 func (s *openAIAccountModelTransientState) size() int {
 	if s == nil {
 		return 0

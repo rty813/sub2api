@@ -194,6 +194,60 @@ describe('AccountUsageCell', () => {
     wrapper.unmount()
   })
 
+  it('shows a rate-limit pause instead of a retry countdown, even for a still-valid ticket', async () => {
+    getUsage.mockResolvedValue({})
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 9704,
+          platform: 'openai',
+          type: 'oauth',
+          codex_turn_tickets: [
+            // Account-wide limit: nothing is being harvested, and there is no
+            // failure history because a skip is not a failure.
+            {
+              model: 'gpt-6-astra',
+              ready: false,
+              remaining_seconds: 0,
+              blocked: true,
+              harvest_paused: true,
+              cooldown_scope: 'account',
+              cooldown_reason: 'rate_limited',
+              cooldown_in_seconds: 250,
+            },
+            // Same account, still-valid ticket: the pause is worth showing, but
+            // the ticket's own remaining time must stay visible.
+            {
+              model: 'gpt-5.6-sol',
+              ready: true,
+              remaining_seconds: 600,
+              blocked: false,
+              harvest_paused: true,
+              cooldown_scope: 'account',
+              cooldown_reason: 'rate_limited',
+              cooldown_in_seconds: 250,
+            },
+          ],
+        }),
+      },
+      global: { stubs: {
+        OpenAIQuotaResetCell: { template: '<div data-test="quota-reset" />' },
+        UsageProgressBar: true,
+        AccountQuotaInfo: true,
+      } },
+    })
+    await flushPromises()
+
+    // The local t() mock drops params, so the interpolated wait is asserted in
+    // codexTicketStatus.spec.ts; here the point is which label gets chosen.
+    expect(wrapper.text()).toContain('admin.accounts.openai.codexTurnTicketCooldownIn')
+    // A pause is not a backoff: no retry line, no failure detail.
+    expect(wrapper.text()).not.toContain('codexTurnTicketRetry')
+    expect(wrapper.text()).not.toContain('codexTurnTicketFailureDetail')
+    expect(wrapper.text()).toContain('10m00s')
+    wrapper.unmount()
+  })
+
   it('never leaks ticket material or proxy credentials into the cell', async () => {
     getUsage.mockResolvedValue({})
     const wrapper = mount(AccountUsageCell, {

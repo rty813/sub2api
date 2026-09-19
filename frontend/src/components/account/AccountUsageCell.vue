@@ -129,7 +129,7 @@
           <span v-if="ticket.ready" class="text-emerald-600 dark:text-emerald-400">{{ formatCodexTicketRemaining(ticket.remaining_seconds) }}</span>
           <span v-else-if="ticket.blocked" class="text-amber-600 dark:text-amber-400">{{ t('admin.accounts.openai.codexTurnTicketPaused') }}</span>
           <span v-else class="text-gray-500">{{ t('admin.accounts.openai.codexTurnTicketMissing') }}</span>
-          <span v-if="!ticket.ready && ticket.consecutive_failures" class="truncate text-gray-400 dark:text-gray-500">
+          <span v-if="!ticket.ready && (ticket.consecutive_failures || ticket.harvest_paused)" class="truncate text-gray-400 dark:text-gray-500">
             {{ codexTicketRetryLabel(ticket) }}
           </span>
         </div>

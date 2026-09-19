@@ -2273,7 +2273,7 @@
               <span v-else class="text-gray-500">{{ t('admin.accounts.openai.codexTurnTicketMissing') }}</span>
             </div>
             <p
-              v-if="!ticket.ready && ticket.consecutive_failures"
+              v-if="ticket.harvest_paused || (!ticket.ready && ticket.consecutive_failures)"
               class="text-xs text-gray-500 dark:text-gray-400"
               data-testid="codex-ticket-failure-detail"
             >

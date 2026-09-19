@@ -1181,6 +1181,13 @@ export interface Account {
     consecutive_failures?: number
     next_retry_at?: string
     retry_in_seconds?: number
+    // Harvest paused by an upstream rate-limit / cooldown window (account-wide
+    // or model-scoped). A wait, not a failure: the failure counter stays put.
+    harvest_paused?: boolean
+    cooldown_scope?: 'account' | 'model'
+    cooldown_reason?: string
+    cooldown_until?: string
+    cooldown_in_seconds?: number
   }>
   // Extra fields including Codex usage, OpenAI compact capability, and model-level rate limits.
   extra?: (CodexUsageSnapshot & OpenAICompactState & {
