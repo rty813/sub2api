@@ -80,6 +80,9 @@ func (s *OpenAIGatewayService) openAICodexTicketConfig() config.OpenAICodexTicke
 	if cfg.HarvestAttemptTimeoutSeconds <= 0 {
 		cfg.HarvestAttemptTimeoutSeconds = 25
 	}
+	if cfg.HarvestMaxConcurrency <= 0 {
+		cfg.HarvestMaxConcurrency = 4
+	}
 	if len(cfg.Models) == 0 {
 		cfg.Models = []string{openAICodexTicketDefaultModel, openAICodexTicketDefaultSolModel}
 	}
@@ -100,6 +103,8 @@ func (s *OpenAIGatewayService) openAICodexTicketGatedModel(model string) bool {
 }
 
 // OpenAICodexTicketStatus 是给管理端看的门票摘要，不含 state blob。
+// 采票失败信息只暴露分类后的 reason 与计数：不回传 token、ticket、代理密码
+// 或上游原始响应体。
 type OpenAICodexTicketStatus struct {
 	Model            string     `json:"model"`
 	Length           int        `json:"length,omitempty"`
@@ -107,8 +112,20 @@ type OpenAICodexTicketStatus struct {
 	RemainingSeconds int64      `json:"remaining_seconds"`
 	Blocked          bool       `json:"blocked"`
 	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
+	// LastFailureReason 是归一化后的失败类别（network/rate_limited/...），
+	// 不是上游原文。为空表示当前没有未恢复的失败。
+	LastFailureReason string `json:"last_failure_reason,omitempty"`
+	// LastFailureStatus 是上游 HTTP 状态码；传输层失败时为 0（省略）。
+	LastFailureStatus   int        `json:"last_failure_status,omitempty"`
+	ConsecutiveFailures int        `json:"consecutive_failures,omitempty"`
+	NextRetryAt         *time.Time `json:"next_retry_at,omitempty"`
+	// RetryInSeconds 是相对于本次查询时刻的剩余等待秒数，方便前端直接展示。
+	RetryInSeconds int64 `json:"retry_in_seconds,omitempty"`
 }
 
+// OpenAICodexTicketStatuses 只读取门票本身，不含退避状态；带退避状态的版本是
+// OpenAIGatewayService.OpenAICodexTicketStatusesForAccount。保留本函数的签名，
+// 因为它是纯函数且被多处（含无 gateway 实例的路径）使用。
 func OpenAICodexTicketStatuses(account *Account, cfg config.OpenAICodexTicketConfig, now time.Time) []OpenAICodexTicketStatus {
 	if !cfg.Enabled || !isOpenAICodexTicketAccount(account) {
 		return nil
@@ -144,6 +161,33 @@ func OpenAICodexTicketStatuses(account *Account, cfg config.OpenAICodexTicketCon
 		}
 		status.Blocked = cfg.FailClosed && !status.Ready
 		out = append(out, status)
+	}
+	return out
+}
+
+// OpenAICodexTicketStatusesForAccount 在门票摘要上叠加采票退避状态，供管理端
+// 解释「为什么这个号这个模型还没有票、什么时候会再试」。
+// 退避状态是内存态：网关实例缺失或刚重启时这些字段为空，表示「下个周期就会重试」。
+func (s *OpenAIGatewayService) OpenAICodexTicketStatusesForAccount(account *Account, cfg config.OpenAICodexTicketConfig, now time.Time) []OpenAICodexTicketStatus {
+	out := OpenAICodexTicketStatuses(account, cfg, now)
+	if s == nil || account == nil || account.ID <= 0 {
+		return out
+	}
+	for i := range out {
+		state := s.openAICodexTicketRetrySnapshot(openAICodexTicketKey(account.ID, out[i].Model))
+		if state.ConsecutiveFailures <= 0 {
+			continue
+		}
+		out[i].LastFailureReason = string(state.Reason)
+		out[i].LastFailureStatus = state.LastHTTPStatus
+		out[i].ConsecutiveFailures = state.ConsecutiveFailures
+		if !state.NextRetryAt.IsZero() {
+			next := state.NextRetryAt
+			out[i].NextRetryAt = &next
+			if remaining := int64(next.Sub(now) / time.Second); remaining > 0 {
+				out[i].RetryInSeconds = remaining
+			}
+		}
 	}
 	return out
 }
@@ -357,14 +401,16 @@ func (s *OpenAIGatewayService) openAICodexTicketBlocksAccount(account *Account, 
 	return !ticket.valid(time.Now(), cfg.TargetLength)
 }
 
-func (s *OpenAIGatewayService) fireOpenAICodexTicketProbe(ctx context.Context, account *Account, token, model, proxyURL string, attemptTimeout time.Duration) (state string, status int, err error) {
+// fireOpenAICodexTicketProbe 返回 header 而不只是 turn-state：429 的 Retry-After
+// 必须由调用方读到，才能让退避遵守上游给的等待时间。
+func (s *OpenAIGatewayService) fireOpenAICodexTicketProbe(ctx context.Context, account *Account, token, model, proxyURL string, attemptTimeout time.Duration) (state string, status int, header http.Header, err error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 	defer cancel()
 
 	body := []byte(`{"model":` + jsonString(model) + `,"store":false,"stream":true,"instructions":"Reply with exactly: pong","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}]}`)
 	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, chatgptCodexURL, bytes.NewReader(body))
 	if err != nil {
-		return "", 0, err
+		return "", 0, nil, err
 	}
 	req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAIHarvest))
 	req.Close = true
@@ -375,7 +421,7 @@ func (s *OpenAIGatewayService) fireOpenAICodexTicketProbe(ctx context.Context, a
 	req.Header.Set("OpenAI-Beta", "responses=experimental")
 	req.Header.Set("session_id", uuid.NewString())
 	if err := resolveAndSetOpenAIChatGPTAccountHeaders(attemptCtx, s.accountRepo, req.Header, account); err != nil {
-		return "", 0, err
+		return "", 0, nil, err
 	}
 	applyOpenAICodexTicketHarvestIdentity(req.Header, model)
 
@@ -384,10 +430,10 @@ func (s *OpenAIGatewayService) fireOpenAICodexTicketProbe(ctx context.Context, a
 	// while handlers are still wiring it during gateway construction.
 	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
 	if err != nil {
-		return "", 0, err
+		return "", 0, nil, err
 	}
 	if resp == nil {
-		return "", 0, errors.New("nil upstream response")
+		return "", 0, nil, errors.New("nil upstream response")
 	}
 	// Only the response header is needed; no connection will be reused.
 	defer func() {
@@ -395,7 +441,7 @@ func (s *OpenAIGatewayService) fireOpenAICodexTicketProbe(ctx context.Context, a
 			_ = resp.Body.Close()
 		}
 	}()
-	return extractOpenAICodexTurnState(resp.Header), resp.StatusCode, nil
+	return extractOpenAICodexTurnState(resp.Header), resp.StatusCode, resp.Header, nil
 }
 
 func jsonString(v string) string {
@@ -476,9 +522,10 @@ func (s *OpenAIGatewayService) openAICodexTicketHarvestLoop(ctx context.Context)
 	}
 }
 
-// refreshOpenAICodexTickets probes each account/model with a missing or soon-to-expire
-// ticket once. The loop waits for all probes, then waits the configured interval
-// before starting the next cycle.
+// refreshOpenAICodexTickets probes each account/model whose ticket is missing or
+// close to expiry and whose per-key backoff has elapsed. Probes run under a global
+// concurrency bound; the loop waits for the cycle to drain, then sleeps the
+// configured interval before the next one.
 func (s *OpenAIGatewayService) refreshOpenAICodexTickets(ctx context.Context) {
 	if s == nil || s.accountRepo == nil || ctx.Err() != nil || !s.openAICodexTicketEnabledContext(ctx) {
 		return
@@ -489,10 +536,21 @@ func (s *OpenAIGatewayService) refreshOpenAICodexTickets(ctx context.Context) {
 		return
 	}
 	cfg := s.openAICodexTicketConfig()
+	proxyURL := s.openAICodexTicketHarvestProxyURLContext(ctx)
+	// 代理配置是退避状态的「代」：改了代理就说明运维动过手，此前基于旧配置
+	// 积累的失败不该再拖住重试（唯一例外是仍然有效的 429，见 applyConfigFingerprint）。
+	fingerprint := openAICodexTicketConfigFingerprint(proxyURL, cfg)
 	now := time.Now()
 	refreshBefore := time.Duration(cfg.RefreshBeforeSeconds) * time.Second
-	var wg sync.WaitGroup
-	probed := 0
+
+	live := make(map[string]struct{})
+	type harvestTarget struct {
+		account Account
+		model   string
+		key     string
+	}
+	targets := make([]harvestTarget, 0, len(accounts))
+	selected := 0
 	for i := range accounts {
 		account := accounts[i]
 		if account.Status != StatusActive || !isOpenAICodexTicketAccount(&account) {
@@ -503,60 +561,119 @@ func (s *OpenAIGatewayService) refreshOpenAICodexTickets(ctx context.Context) {
 			if model == "" {
 				continue
 			}
+			key := openAICodexTicketKey(account.ID, model)
+			live[key] = struct{}{}
 			// 已有一张有效且未临近过期的票 → 本周期不打，省得白刷。
 			if t := s.lookupOpenAICodexTicket(&account, model); t.valid(now, cfg.TargetLength) && !t.needsRefresh(now, refreshBefore) {
+				continue
+			}
+			selected++
+			state := s.openAICodexTicketRetryMutate(key, func(st openAICodexTicketRetryState) openAICodexTicketRetryState {
+				return st.applyConfigFingerprint(fingerprint, now)
+			})
+			if !state.dueAt(now) {
 				continue
 			}
 			acc := account
 			// Token/header helpers may update account metadata; each model owns its maps.
 			acc.Extra = maps.Clone(account.Extra)
 			acc.Credentials = maps.Clone(account.Credentials)
-			probed++
+			targets = append(targets, harvestTarget{account: acc, model: model, key: key})
+		}
+	}
+	s.pruneOpenAICodexTicketRetry(live)
+
+	limit := cfg.HarvestMaxConcurrency
+	if limit > len(targets) {
+		limit = len(targets)
+	}
+	var wg sync.WaitGroup
+	if limit > 0 {
+		sem := make(chan struct{}, limit)
+		for _, target := range targets {
+			// 取消时不再派新任务，也不把已排队的算成失败。
+			if ctx.Err() != nil {
+				break
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				// 已启动的 goroutine 由下面的 wg.Wait 收尾，不泄漏。
+				wg.Wait()
+				return
+			}
 			wg.Add(1)
-			go func(acc Account, model string) {
+			go func(target harvestTarget) {
 				defer wg.Done()
-				s.probeOnceOpenAICodexTicket(ctx, &acc, model)
-			}(acc, model)
+				defer func() { <-sem }()
+				s.probeOnceOpenAICodexTicket(ctx, &target.account, target.model)
+			}(target)
 		}
 	}
 	wg.Wait()
-	if probed > 0 {
-		logger.L().Info("openai_codex_ticket probe cycle", zap.Int("probed", probed))
+	if selected > 0 {
+		logger.L().Info("openai_codex_ticket probe cycle",
+			zap.Int("selected", selected),
+			zap.Int("attempted", len(targets)),
+			zap.Int("deferred", selected-len(targets)),
+			zap.Int("max_concurrency", cfg.HarvestMaxConcurrency),
+		)
 	}
 }
 
+// openAICodexTicketConfigFingerprint 概括所有会影响「这一发该不该打、怎么打」的
+// 采票配置。只取代理与判定门票合格性的参数：模型列表与开关由调用方另行门控。
+// 代理带密码，所以用脱敏形式参与指纹，避免把凭据留在内存状态里。
+func openAICodexTicketConfigFingerprint(proxyURL string, cfg config.OpenAICodexTicketConfig) string {
+	return strings.Join([]string{
+		MaskProxyURL(proxyURL),
+		strconv.Itoa(cfg.TargetLength),
+		strconv.Itoa(cfg.HarvestAttemptTimeoutSeconds),
+	}, "\x00")
+}
+
 // probeOnceOpenAICodexTicket 走打票代理打一发。命中合格 292（HTTP 200、长度==target、
-// gAAAAA 前缀）就落库；否则记 Info miss，交给下个周期重试。同一 key 并发去重，避免上一发还没
-// 回来又叠一发。
+// gAAAAA 前缀）就落库并清空退避；否则按故障类别推进退避，交给后续周期重试。
+// 同一 key 并发去重，避免上一发还没回来又叠一发。
 func (s *OpenAIGatewayService) probeOnceOpenAICodexTicket(ctx context.Context, account *Account, model string) {
 	if s == nil || !isOpenAICodexTicketAccount(account) || ctx.Err() != nil || !s.openAICodexTicketEnabledContext(ctx) {
 		return
 	}
 	cfg := s.openAICodexTicketConfig()
+	key := openAICodexTicketKey(account.ID, model)
 	proxyURL := s.openAICodexTicketHarvestProxyURLContext(ctx)
-	if proxyURL == "" || s.httpUpstream == nil || ctx.Err() != nil {
+	if proxyURL == "" || ValidateOpenAICodexTicketHarvestProxyURL(proxyURL) != nil {
+		// 代理缺失或语法非法：不打空请求，明确记为配置错误。
+		// 配置一经修正，指纹变化会在下个周期立刻解除这条退避。
+		s.recordOpenAICodexTicketFailure(key, account.ID, model,
+			openAICodexTicketFailureProxyConfig, 0, 0, errOpenAICodexTicketProxyUnset)
 		return
 	}
-	key := openAICodexTicketKey(account.ID, model)
+	if s.httpUpstream == nil || ctx.Err() != nil {
+		return
+	}
 	_, _, _ = s.openaiCodexTicketFlight.Do(key, func() (any, error) {
 		token, _, err := s.GetAccessToken(ctx, account)
 		if err != nil || strings.TrimSpace(token) == "" {
-			logger.L().Info("openai_codex_ticket probe miss",
-				zap.Int64("account_id", account.ID), zap.String("model", model),
-				zap.String("reason", "token"), zap.Error(err))
+			if ctx.Err() != nil {
+				// 采集器正在停止：取消不是账号的失败，不记退避。
+				return nil, nil
+			}
+			s.recordOpenAICodexTicketFailure(key, account.ID, model,
+				openAICodexTicketFailureToken, 0, 0, err)
 			return nil, nil
 		}
-		state, status, perr := s.fireOpenAICodexTicketProbe(ctx, account, token, model, proxyURL, time.Duration(cfg.HarvestAttemptTimeoutSeconds)*time.Second)
-		if perr != nil {
-			logger.L().Info("openai_codex_ticket probe miss",
-				zap.Int64("account_id", account.ID), zap.String("model", model),
-				zap.String("reason", "error"), zap.Error(perr))
+		state, status, header, perr := s.fireOpenAICodexTicketProbe(ctx, account, token, model, proxyURL, time.Duration(cfg.HarvestAttemptTimeoutSeconds)*time.Second)
+		if perr != nil && (ctx.Err() != nil || errors.Is(perr, context.Canceled)) {
 			return nil, nil
 		}
-		if status != http.StatusOK || state == "" || len(state) != cfg.TargetLength || !strings.HasPrefix(state, openAICodexTicketStatePrefix) {
-			logger.L().Info("openai_codex_ticket probe miss",
-				zap.Int64("account_id", account.ID), zap.String("model", model),
-				zap.Int("http", status), zap.Int("len", len(state)))
+		if perr != nil || status != http.StatusOK || state == "" || len(state) != cfg.TargetLength || !strings.HasPrefix(state, openAICodexTicketStatePrefix) {
+			reason := classifyOpenAICodexTicketFailure(status, perr)
+			retryAfter := time.Duration(0)
+			if reason == openAICodexTicketFailureRateLimited {
+				retryAfter = openAICodexTicketRetryAfter(header, time.Now())
+			}
+			s.recordOpenAICodexTicketFailure(key, account.ID, model, reason, status, retryAfter, perr)
 			return nil, nil
 		}
 		now := time.Now()
@@ -570,11 +687,49 @@ func (s *OpenAIGatewayService) probeOnceOpenAICodexTicket(ctx context.Context, a
 			Attempts:   1,
 		}
 		s.storeOpenAICodexTicket(ctx, account, ticket)
+		s.openAICodexTicketRetryMutate(key, func(st openAICodexTicketRetryState) openAICodexTicketRetryState {
+			return st.recordSuccess()
+		})
 		logger.L().Info("openai_codex_ticket harvested",
 			zap.Int64("account_id", account.ID), zap.String("model", model),
 			zap.Int("length", ticket.Length), zap.String("mode", "continuous"))
 		return nil, nil
 	})
+}
+
+// recordOpenAICodexTicketFailure 推进退避并记一行日志。日志按 Info 级别写，
+// 经 shouldIndex 过滤后不会进 ops 系统日志表；退避本身已经把失败频率压下来了，
+// 所以这里不会变成无界写入。
+func (s *OpenAIGatewayService) recordOpenAICodexTicketFailure(
+	key string,
+	accountID int64,
+	model string,
+	reason openAICodexTicketFailureReason,
+	status int,
+	retryAfter time.Duration,
+	cause error,
+) {
+	now := time.Now()
+	state := s.openAICodexTicketRetryMutate(key, func(st openAICodexTicketRetryState) openAICodexTicketRetryState {
+		return st.recordFailure(reason, status, retryAfter, now)
+	})
+	fields := []zap.Field{
+		zap.Int64("account_id", accountID),
+		zap.String("model", model),
+		zap.String("reason", string(reason)),
+		zap.Int("consecutive_failures", state.ConsecutiveFailures),
+		zap.Duration("retry_in", state.NextRetryAt.Sub(now)),
+	}
+	if status > 0 {
+		fields = append(fields, zap.Int("http", status))
+	}
+	if retryAfter > 0 {
+		fields = append(fields, zap.Duration("retry_after", retryAfter))
+	}
+	if cause != nil {
+		fields = append(fields, zap.Error(cause))
+	}
+	logger.L().Info("openai_codex_ticket probe miss", fields...)
 }
 
 // IsOpenAICodexTicketExtraKey identifies server-managed ticket material.

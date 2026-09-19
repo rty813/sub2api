@@ -2261,15 +2261,24 @@
           {{ t('admin.accounts.openai.codexTurnTicketDesc') }}
         </p>
         <div class="mt-3 space-y-1.5">
-          <div v-for="ticket in codexTurnTickets" :key="ticket.model" class="flex items-center justify-between text-sm">
-            <span class="font-medium">{{ ticket.model }}</span>
-            <span v-if="ticket.ready" class="text-emerald-600 dark:text-emerald-400">
-              {{ t('admin.accounts.openai.codexTurnTicketReady', { time: formatCodexTicketRemaining(ticket.remaining_seconds) }) }}
-            </span>
-            <span v-else-if="ticket.blocked" class="text-amber-600 dark:text-amber-400">
-              {{ t('admin.accounts.openai.codexTurnTicketPaused') }}
-            </span>
-            <span v-else class="text-gray-500">{{ t('admin.accounts.openai.codexTurnTicketMissing') }}</span>
+          <div v-for="ticket in codexTurnTickets" :key="ticket.model" class="space-y-0.5">
+            <div class="flex items-center justify-between text-sm">
+              <span class="font-medium">{{ ticket.model }}</span>
+              <span v-if="ticket.ready" class="text-emerald-600 dark:text-emerald-400">
+                {{ t('admin.accounts.openai.codexTurnTicketReady', { time: formatCodexTicketRemaining(ticket.remaining_seconds) }) }}
+              </span>
+              <span v-else-if="ticket.blocked" class="text-amber-600 dark:text-amber-400">
+                {{ t('admin.accounts.openai.codexTurnTicketPaused') }}
+              </span>
+              <span v-else class="text-gray-500">{{ t('admin.accounts.openai.codexTurnTicketMissing') }}</span>
+            </div>
+            <p
+              v-if="!ticket.ready && ticket.consecutive_failures"
+              class="text-xs text-gray-500 dark:text-gray-400"
+              data-testid="codex-ticket-failure-detail"
+            >
+              {{ codexTicketFailureDetail(ticket) }}
+            </p>
           </div>
         </div>
       </div>
@@ -3117,6 +3126,10 @@ import {
 import { createStableObjectKeyResolver } from '@/utils/stableObjectKey'
 import { getAccountExpiryTimestamp } from '@/components/account/accountExpiry'
 import { allSelectedGroupsEnableLongContextPricing } from '@/components/account/longContextBilling'
+import {
+  codexTicketFailureDetail as ticketFailureDetail,
+  type CodexTicketRetryState,
+} from '@/components/account/codexTicketStatus'
 import { VERTEX_LOCATION_OPTIONS } from '@/constants/account'
 import {
   OPENAI_WS_MODE_CTX_POOL,
@@ -3175,6 +3188,10 @@ function formatCodexTicketRemaining(seconds: number) {
   const m = Math.floor(total / 60)
   const s = total % 60
   return `${m}m${String(s).padStart(2, '0')}s`
+}
+
+function codexTicketFailureDetail(ticket: CodexTicketRetryState) {
+  return ticketFailureDetail(t, ticket)
 }
 
 const hideAccountLongContextBilling = computed(() => {

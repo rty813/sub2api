@@ -515,6 +515,10 @@ type OpenAIGatewayService struct {
 	openaiCodexTicketCancel      context.CancelFunc
 	openaiCodexTicketDone        chan struct{}
 	openaiCodexTicketStopped     bool
+	// openaiCodexTicketRetry: accountID\x00model → 采票退避状态（仅内存，重启清空）。
+	// 用普通 map + mutex 而不是 sync.Map：写是读-改-写，必须整体互斥。
+	openaiCodexTicketRetryMu sync.Mutex
+	openaiCodexTicketRetry   map[string]openAICodexTicketRetryState
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

@@ -1175,6 +1175,12 @@ export interface Account {
     remaining_seconds: number
     blocked: boolean
     expires_at?: string
+    // Harvest backoff state (in-memory; absent right after a restart).
+    last_failure_reason?: string
+    last_failure_status?: number
+    consecutive_failures?: number
+    next_retry_at?: string
+    retry_in_seconds?: number
   }>
   // Extra fields including Codex usage, OpenAI compact capability, and model-level rate limits.
   extra?: (CodexUsageSnapshot & OpenAICompactState & {

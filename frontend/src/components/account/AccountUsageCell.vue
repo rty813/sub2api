@@ -123,11 +123,15 @@
           v-for="ticket in codexTurnTickets"
           :key="ticket.model"
           class="flex items-center gap-1 text-[10px] leading-4"
+          :title="codexTicketTooltip(ticket)"
         >
           <span class="truncate font-medium text-gray-500 dark:text-gray-400" :title="ticket.model">{{ shortCodexTicketModel(ticket.model) }}</span>
           <span v-if="ticket.ready" class="text-emerald-600 dark:text-emerald-400">{{ formatCodexTicketRemaining(ticket.remaining_seconds) }}</span>
           <span v-else-if="ticket.blocked" class="text-amber-600 dark:text-amber-400">{{ t('admin.accounts.openai.codexTurnTicketPaused') }}</span>
           <span v-else class="text-gray-500">{{ t('admin.accounts.openai.codexTurnTicketMissing') }}</span>
+          <span v-if="!ticket.ready && ticket.consecutive_failures" class="truncate text-gray-400 dark:text-gray-500">
+            {{ codexTicketRetryLabel(ticket) }}
+          </span>
         </div>
       </div>
       <div v-if="hasOpenAIUsageFallback" class="space-y-1">
@@ -675,6 +679,11 @@ import CNProviderQuotaCell from './CNProviderQuotaCell.vue'
 import CNProviderBalanceCell from './CNProviderBalanceCell.vue'
 import OllamaCloudUsageCell from './OllamaCloudUsageCell.vue'
 import { cnQuotaCellVisible as cnQuotaCellVisibleFn, cnBalanceCellVisible as cnBalanceCellVisibleFn } from './credentialsBuilder'
+import {
+  codexTicketRetryLabel as retryLabel,
+  codexTicketFailureDetail as failureDetail,
+  type CodexTicketRetryState,
+} from './codexTicketStatus'
 
 // Module-level cache shared across all AccountUsageCell instances
 const _usageCache = new Map<number, { data: AccountUsageInfo; ts: number }>()
@@ -806,6 +815,15 @@ function shortCodexTicketModel(model: string) {
   if (model === 'gpt-6-astra') return 'astra'
   if (model === 'gpt-5.6-sol') return 'sol'
   return model
+}
+
+function codexTicketRetryLabel(ticket: CodexTicketRetryState) {
+  return retryLabel(t, ticket)
+}
+
+function codexTicketTooltip(ticket: CodexTicketRetryState & { model: string }) {
+  const detail = failureDetail(t, ticket)
+  return detail ? `${ticket.model} — ${detail}` : ticket.model
 }
 
 function formatCodexTicketRemaining(seconds: number) {

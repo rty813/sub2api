@@ -66,6 +66,7 @@ type AccountHandler struct {
 	upstreamBillingProbe    *service.UpstreamBillingProbeService
 	ollamaCloudUsage        *service.OllamaCloudUsageService
 	codexTicketSettings     *service.SettingService
+	codexTicketGateway      *service.OpenAIGatewayService
 	cfg                     *config.Config
 }
 
@@ -81,6 +82,12 @@ func (h *AccountHandler) SetOllamaCloudUsageService(usage *service.OllamaCloudUs
 // SetCodexTicketSettings supplies the live policy without mutating shared config.
 func (h *AccountHandler) SetCodexTicketSettings(settings *service.SettingService) {
 	h.codexTicketSettings = settings
+}
+
+// SetCodexTicketGateway supplies the harvester's in-memory retry state so the
+// admin API can explain why a model has no ticket yet.
+func (h *AccountHandler) SetCodexTicketGateway(gateway *service.OpenAIGatewayService) {
+	h.codexTicketGateway = gateway
 }
 
 // NewAccountHandler creates a new admin account handler
@@ -367,6 +374,11 @@ func (h *AccountHandler) enrichCodexTicketStatus(account *service.Account, out *
 		cfg := h.cfg.Gateway.OpenAICodexTicket
 		if h.codexTicketSettings != nil {
 			cfg.Enabled = h.codexTicketSettings.GetOpenAICodexTicketEnabled(context.Background(), cfg.Enabled)
+		}
+		// 带上采票退避状态；网关未注入时退化为纯门票摘要。
+		if h.codexTicketGateway != nil {
+			out.CodexTurnTickets = h.codexTicketGateway.OpenAICodexTicketStatusesForAccount(account, cfg, time.Now())
+			return
 		}
 		out.CodexTurnTickets = service.OpenAICodexTicketStatuses(account, cfg, time.Now())
 	}
